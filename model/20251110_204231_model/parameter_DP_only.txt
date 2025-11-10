@@ -1,0 +1,14 @@
+BASE_DIR: D:\hjc_files\python_scirpt\MSG_DP
+DATA_DIR: D:\hjc_files\python_scirpt\MSG_DP\data\1030data_sy
+SEQ_LEN: 32
+K: 20
+PREDICT_STEPS: 5
+COND_DIM: 8 (7-d one-hot emotion + 1-d level [0,1])
+MODEL_DIM: 128
+NUM_LAYERS: 3
+BATCH_SIZE: 64
+LR: 0.0001
+EPOCHS: 1000
+NUM_WORKERS: 0
+Best Val Loss: 0.001329642992594723
+Total training time (s): 341.30
