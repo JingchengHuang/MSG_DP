@@ -20,7 +20,7 @@ MODEL_DIR = BASE_DIR / "model" / "20251110_161351_model"
 SEQ_LEN = 1          # frames per window for encoder -> one z (changed to 1 to match AE)
 FEATURE_DIM = 32     # raw control dim
 Z_DIM = 16           # latent dim from encoder (changed to match AE)
-K = 10                # number of historical z tokens used as input to DP
+K = 20                # number of historical z tokens used as input to DP
 COND_DIM = 8         # 7-d one-hot emotion + 1-d level
 
 # DP model / training hyperparams
@@ -59,43 +59,32 @@ class Encoder(nn.Module):
         # Return only the last frame's z if seq_len > 1, or the z if seq_len = 1
         return z[:, -1, :] if seq_len > 1 else z.squeeze(1)  # (batch, z_dim)
 
-# ------------------- Temporal Transformer Model -------------------
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=500):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # (1, max_len, d_model) - 修改为适应batch_first
-        self.register_buffer('pe', pe)
-
-    def forward(self, x):
-        seq_len = x.size(1)  # 修改为适应batch_first
-        x = x + self.pe[:, :seq_len]
-        return x
-
-class TemporalTransformer(nn.Module):
-    def __init__(self, z_dim=Z_DIM, cond_dim=COND_DIM, model_dim=MODEL_DIM,
-                 nhead=NHEAD, num_layers=NUM_TRANSFORMER_LAYERS, ff_dim=FF_DIM, dropout=DROPOUT):
+# ------------------- DP LSTM Model -------------------
+class DPLSTM(nn.Module):
+    def __init__(self, z_dim=Z_DIM, cond_dim=COND_DIM, hidden_size=128, num_layers=2, dropout=0.1):
         super().__init__()
         self.input_dim = z_dim + cond_dim
-        self.model_dim = model_dim
-        self.input_fc = nn.Linear(self.input_dim, model_dim)
-        self.pos_enc = PositionalEncoding(model_dim, max_len=K + 5)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=model_dim, nhead=nhead, dim_feedforward=ff_dim, dropout=dropout, batch_first=True)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.out_fc = nn.Linear(model_dim, z_dim)
-
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        
+        # LSTM层
+        self.lstm = nn.LSTM(
+            input_size=self.input_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
+        
+        # 输出层
+        self.fc = nn.Linear(hidden_size, z_dim)
+        
     def forward(self, z_seq_cond):
         # z_seq_cond: (batch, k, z_dim + cond_dim)
-        x = self.input_fc(z_seq_cond)  # (batch, k, model_dim)
-        # x = x.permute(1, 0, 2)         # 不再需要这行，因为使用batch_first=True
-        x = self.pos_enc(x)
-        x = self.transformer(x)        # (batch, k, model_dim) - 使用batch_first=True
-        last = x[:, -1, :]             # (batch, model_dim) -- last time token representation
-        z_pred = self.out_fc(last)     # (batch, z_dim)
+        lstm_out, _ = self.lstm(z_seq_cond)
+        # 取最后一个时间步的输出
+        last_output = lstm_out[:, -1, :]  # (batch, hidden_size)
+        z_pred = self.fc(last_output)     # (batch, z_dim)
         return z_pred
 
 # ------------------- Preprocessing: make z sequences using encoder -------------------
@@ -280,8 +269,8 @@ def train_dp():
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
 
-    dp_model = TemporalTransformer(z_dim=Z_DIM, cond_dim=COND_DIM, model_dim=MODEL_DIM,
-                                   nhead=NHEAD, num_layers=NUM_TRANSFORMER_LAYERS, ff_dim=FF_DIM, dropout=DROPOUT).to(device)
+    dp_model = DPLSTM(z_dim=Z_DIM, cond_dim=COND_DIM, hidden_size=MODEL_DIM,
+                      num_layers=NUM_TRANSFORMER_LAYERS, dropout=DROPOUT).to(device)
     optimizer = torch.optim.Adam(dp_model.parameters(), lr=LR)
     criterion = nn.MSELoss()
 
@@ -358,9 +347,7 @@ def train_dp():
         f.write(f"K: {K}\n")
         f.write(f"COND_DIM: {COND_DIM} (7-d one-hot emotion + 1-d level [0,1])\n")
         f.write(f"MODEL_DIM: {MODEL_DIM}\n")
-        f.write(f"NHEAD: {NHEAD}\n")
-        f.write(f"NUM_TRANSFORMER_LAYERS: {NUM_TRANSFORMER_LAYERS}\n")
-        f.write(f"FF_DIM: {FF_DIM}\n")
+        f.write(f"NUM_LAYERS: {NUM_TRANSFORMER_LAYERS}\n")
         f.write(f"BATCH_SIZE: {BATCH_SIZE}\n")
         f.write(f"LR: {LR}\n")
         f.write(f"EPOCHS: {EPOCHS}\n")

@@ -21,7 +21,7 @@ EMOTION = "angry"    # 情绪类型: 'happy','angry','sad','surprise','disgust',
 LEVEL = 1.0            # 情绪强度: 0.0-1.0
 
 SEQ_LEN = 1            # 新框架中SEQ_LEN为1
-HISTORY_K = 10         # 与训练时的K值保持一致
+HISTORY_K = 20         # 与训练时的K值保持一致
 
 NOISE_LEVEL = 0.01     # 噪声扰动水平
 TEMPERATURE = 0.1      # 温度调节参数
@@ -71,56 +71,43 @@ class Decoder(nn.Module):
         out[:, 29:] = torch.tanh(out[:, 29:])     # 控制参数的范围
         return out
 
-# ========== PositionalEncoding (matches training's pos_enc.pe) ==========
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=500):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # (1, max_len, d_model) - 适配batch_first
-        self.register_buffer('pe', pe)
-
-    def forward(self, x):
-        seq_len = x.size(1)  # 适配batch_first
-        x = x + self.pe[:, :seq_len]
-        return x
-
-# ========== DP model matching new training-time architecture ==========
-class DPTemporalTransformer(nn.Module):
-    def __init__(self, z_dim=Z_DIM, cond_dim=COND_DIM, model_dim=128, nhead=8, num_layers=3, ff_dim=256, dropout=0.1):
+# ========== DP LSTM model matching new training-time architecture ==========
+class DPLSTM(nn.Module):
+    def __init__(self, z_dim=Z_DIM, cond_dim=COND_DIM, hidden_size=128, num_layers=3, dropout=0.1):
         super().__init__()
         self.input_dim = z_dim + cond_dim
-        self.model_dim = model_dim
-        self.input_fc = nn.Linear(self.input_dim, model_dim)
-        self.pos_enc = PositionalEncoding(model_dim, max_len=HISTORY_K + 5)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=model_dim, nhead=nhead, dim_feedforward=ff_dim,
-            dropout=dropout, batch_first=True  # 使用batch_first
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        
+        # LSTM层
+        self.lstm = nn.LSTM(
+            input_size=self.input_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.out_fc = nn.Linear(model_dim, z_dim)
-
+        
+        # 输出层
+        self.fc = nn.Linear(hidden_size, z_dim)
+        
     def forward(self, z_seq_cond):
-        x = self.input_fc(z_seq_cond)   # (batch, k, model_dim)
-        # x = x.permute(1, 0, 2)       # 不再需要，因为使用batch_first
-        x = self.pos_enc(x)             # add positional encoding
-        x = self.transformer(x)         # (batch, k, model_dim) - 使用batch_first
-        last = x[:, -1, :]              # (batch, model_dim) -- last time token representation
-        z_pred = self.out_fc(last)      # (batch, z_dim)
+        # z_seq_cond: (batch, k, z_dim + cond_dim)
+        lstm_out, _ = self.lstm(z_seq_cond)
+        # 取最后一个时间步的输出
+        last_output = lstm_out[:, -1, :]  # (batch, hidden_size)
+        z_pred = self.fc(last_output)     # (batch, z_dim)
         return z_pred
 
 # ========== 加载模型权重 ==========
 encoder = Encoder().to(device)
 decoder = Decoder().to(device)
-dp_model = DPTemporalTransformer().to(device)
+dp_model = DPLSTM().to(device)
 
 encoder.load_state_dict(torch.load(MODEL_DIR / "encoder.pt", map_location=device))
 decoder.load_state_dict(torch.load(MODEL_DIR / "decoder.pt", map_location=device))
 # load dp model - ensure filename matches your saved file
-dp_model.load_state_dict(torch.load(MODEL_DIR / "dp_model_final_20251110_172227.pt", map_location=device))
+dp_model.load_state_dict(torch.load(MODEL_DIR / "dp_model_best_20251110_192228.pt", map_location=device))
 
 encoder.eval()
 decoder.eval()
