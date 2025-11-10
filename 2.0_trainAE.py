@@ -1,8 +1,3 @@
-# 训练AE，使用10帧训练得到1帧新的
-# 不加情感标签，只有上述时间信息
-# 得到的encoder和decoder还有潜向量z，用作DP训练
-
-
 import os
 import time
 from pathlib import Path
@@ -18,11 +13,10 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data" / "1030data_sy"
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 MODEL_DIR = BASE_DIR / "model" / f"{timestamp}_model"
-MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-SEQ_LEN = 10
+SEQ_LEN = 1  # 每次输入一帧数据
 FEATURE_DIM = 32
-Z_DIM = 64
+Z_DIM = 16  # 潜向量维度设置为16
 BATCH_SIZE = 64
 LR = 1e-4
 EPOCHS = 100
@@ -31,7 +25,7 @@ NUM_LAYERS = 2      # Encoder和Decoder的LSTM层数
 
 # ------------------- 数据集 -------------------
 class RobotDataset(Dataset):
-    def __init__(self, data_dir, seq_len=10):
+    def __init__(self, data_dir, seq_len=1):  # 修改为 seq_len=1
         self.seq_len = seq_len
         self.data_list = []
 
@@ -39,14 +33,14 @@ class RobotDataset(Dataset):
             if file.endswith(".csv"):
                 file_path = os.path.join(data_dir, file)
                 df = pd.read_csv(file_path)
-                values = df.values[:, :FEATURE_DIM]  # 忽略表头，取32列
+                values = df.values[:, :FEATURE_DIM]  # 取32列
                 num_frames = values.shape[0]
-                if num_frames <= seq_len:
+                if num_frames < seq_len:
                     continue
-                # 随机切片
+                # 随机切片，每次取一帧
                 for start_idx in range(num_frames - seq_len):
                     input_seq = values[start_idx:start_idx + seq_len]
-                    target = values[start_idx + seq_len]
+                    target = values[start_idx + seq_len]  # 下一帧作为目标
                     self.data_list.append((input_seq.astype(np.float32), target.astype(np.float32)))
 
     def __len__(self):
@@ -58,36 +52,25 @@ class RobotDataset(Dataset):
 
 # ------------------- 模型 -------------------
 class Encoder(nn.Module):
-    def __init__(self, input_dim=32, hidden_size=128, num_layers=2, z_dim=64):
+    def __init__(self, input_dim=32, z_dim=16):  # z_dim改为16
         super().__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_size, num_layers=num_layers, batch_first=True, bidirectional=True)
-        self.fc = nn.Linear(hidden_size*2, z_dim)  # Bi-LSTM
+        self.fc = nn.Linear(input_dim, z_dim)  # 通过全连接层直接映射到潜向量
 
     def forward(self, x):
-        _, (h_n, _) = self.lstm(x)  # h_n: (num_layers*2, batch, hidden)
-        h_last = torch.cat([h_n[-2], h_n[-1]], dim=1)  # 拼接双向最后一层
-        z = self.fc(h_last)
+        z = self.fc(x)  # 每一帧直接通过全连接层得到潜向量
         return z
 
 class Decoder(nn.Module):
-    def __init__(self, z_dim=64, hidden_size=128, num_layers=2, output_dim=32, seq_len=10):
+    def __init__(self, z_dim=16, output_dim=32):
         super().__init__()
-        self.seq_len = seq_len
-        self.lstm = nn.LSTM(output_dim, hidden_size, num_layers=num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, output_dim)
-        self.z2h = nn.Linear(z_dim, hidden_size)
+        self.fc = nn.Linear(z_dim, output_dim)  # 潜向量直接映射到控制参数
 
-    def forward(self, z, input_seq):
-        # z -> 初始化隐藏状态
-        h_0 = self.z2h(z).unsqueeze(0).repeat(NUM_LAYERS, 1, 1)
-        c_0 = torch.zeros_like(h_0)
-        # 使用输入序列的最后一帧作为Decoder输入
-        out, _ = self.lstm(input_seq, (h_0, c_0))
-        out = self.fc(out[:, -1, :])
-        # 激活
-        out[:, :29] = torch.sigmoid(out[:, :29])
-        out[:, 29:] = torch.tanh(out[:, 29:])
-        return out
+    def forward(self, z):
+        out = self.fc(z)  # 将潜向量z映射为控制参数
+        # 激活函数，确保控制参数在合理范围内
+        out[:, :29] = torch.sigmoid(out[:, :29])  # 控制参数的范围 [0, 1]
+        out[:, 29:] = torch.tanh(out[:, 29:])  # 控制参数的范围 [-0.8, 0.6] 或 [-0.3, 0.3]
+        return out.squeeze(1)
 
 if __name__ == "__main__":
     # ------------------- 设备 -------------------
@@ -97,7 +80,7 @@ if __name__ == "__main__":
         print(f"GPU Name: {torch.cuda.get_device_name(0)}, Memory Allocated: {torch.cuda.memory_allocated(0)/1024**2:.2f} MB")
 
     # ------------------- 数据加载 -------------------
-    dataset = RobotDataset(DATA_DIR, seq_len=SEQ_LEN)
+    dataset = RobotDataset(DATA_DIR, seq_len=SEQ_LEN)  # 使用seq_len=1
     train_size = int(0.9 * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
@@ -106,15 +89,15 @@ if __name__ == "__main__":
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
 
     # ------------------- 初始化模型 -------------------
-    encoder = Encoder(input_dim=FEATURE_DIM, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, z_dim=Z_DIM).to(device)
-    decoder = Decoder(z_dim=Z_DIM, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, output_dim=FEATURE_DIM, seq_len=SEQ_LEN).to(device)
+    encoder = Encoder(input_dim=FEATURE_DIM, z_dim=Z_DIM).to(device)
+    decoder = Decoder(z_dim=Z_DIM, output_dim=FEATURE_DIM).to(device)
 
     optimizer = torch.optim.Adam(list(encoder.parameters()) + list(decoder.parameters()), lr=LR)
     criterion = nn.MSELoss()
 
     # ------------------- 训练循环 -------------------
     start_time = time.time()
-    for epoch in range(1, EPOCHS+1):
+    for epoch in range(1, EPOCHS + 1):
         # 训练
         encoder.train()
         decoder.train()
@@ -124,7 +107,7 @@ if __name__ == "__main__":
             y_batch = y_batch.to(device)
             optimizer.zero_grad()
             z = encoder(x_batch)
-            y_pred = decoder(z, x_batch)
+            y_pred = decoder(z)
             loss = criterion(y_pred, y_batch)
             loss.backward()
             optimizer.step()
@@ -140,7 +123,7 @@ if __name__ == "__main__":
                 x_batch = x_batch.to(device)
                 y_batch = y_batch.to(device)
                 z = encoder(x_batch)
-                y_pred = decoder(z, x_batch)
+                y_pred = decoder(z)
                 loss = criterion(y_pred, y_batch)
                 val_loss += loss.item() * x_batch.size(0)
         val_loss /= len(val_loader.dataset)
@@ -151,6 +134,8 @@ if __name__ == "__main__":
     print(f"Training finished! Total time: {end_time - start_time:.2f} seconds")
 
     # ------------------- 保存模型 -------------------
+    # 只在训练成功完成时才创建MODEL_DIR文件夹
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
     torch.save(encoder.state_dict(), MODEL_DIR / "encoder.pt")
     torch.save(decoder.state_dict(), MODEL_DIR / "decoder.pt")
 
