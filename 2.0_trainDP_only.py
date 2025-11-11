@@ -20,7 +20,7 @@ MODEL_DIR = BASE_DIR / "model" / f"{timestamp}_model"
 SEQ_LEN = 32         # raw control dim
 K = 20               # number of historical control tokens used as input to DP
 COND_DIM = 8         # 7-d one-hot emotion + 1-d level
-PREDICT_STEPS = 5    # number of future steps to predict
+PREDICT_STEPS = 12   # number of future steps to predict
 
 # DP model / training hyperparams
 MODEL_DIM = 128
@@ -29,7 +29,7 @@ DROPOUT = 0.1
 
 BATCH_SIZE = 64
 LR = 1e-4
-EPOCHS = 100
+EPOCHS = 1000
 
 NUM_WORKERS = 0      # DataLoader workers (set to 0 for Windows compatibility)
 PIN_MEMORY = False

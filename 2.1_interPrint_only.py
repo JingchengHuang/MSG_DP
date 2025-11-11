@@ -12,7 +12,7 @@ import re
 # ========== 配置 ==========
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data" / "1030data_sy"
-MODEL_DIR = BASE_DIR / "model" / "20251110_204231_model"
+MODEL_DIR = BASE_DIR / "model" / "20251110_213909_model"
 OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -21,8 +21,9 @@ EMOTION = "angry"    # 情绪类型: 'happy','angry','sad','surprise','disgust',
 LEVEL = 0.3          # 情绪强度: 0.0-1.0
 
 HISTORY_K = 20       # 使用20帧历史数据
-PREDICT_STEPS = 5    # 每次预测5帧新数据
-GENERATE_FRAMES = 100  # 生成批次数量（每个批次5帧，总共500帧）
+PREDICT_STEPS = 12   # 每次预测12帧新数据
+OVERLAP_STEPS = 4    # 重叠帧数用于均值计算
+GENERATE_FRAMES = 42  # 生成批次数量（每个批次12帧，总共504帧）
 FEATURE_DIM = 32
 COND_DIM = 8         # 7-d one-hot + 1-d intensity
 
@@ -71,7 +72,7 @@ class DPLSTM(nn.Module):
 # ========== 加载模型权重 ==========
 dp_model = DPLSTM(predict_steps=PREDICT_STEPS).to(device)
 # load dp model - ensure filename matches your saved file
-dp_model.load_state_dict(torch.load(MODEL_DIR / "dp_model_final_20251110_204232.pt", map_location=device))
+dp_model.load_state_dict(torch.load(MODEL_DIR / "dp_model_final_20251110_213910.pt", map_location=device))
 
 dp_model.eval()
 print("DP model loaded successfully.")
@@ -145,6 +146,9 @@ def inference_loop():
     for i in range(init_seq.shape[0]):
         gen_controls.append(init_seq[i].copy())
     
+    # 用于存储历史预测结果，用于重叠帧均值计算
+    prediction_history = []
+    
     for step in range(GENERATE_FRAMES):
         # prepare ctrl_hist with cond: expand cond to each timestep and concat
         cond_exp = cond.unsqueeze(1).repeat(1, HISTORY_K, 1)  # (1, HISTORY_K, 8)
@@ -158,7 +162,7 @@ def inference_loop():
             noise = torch.randn_like(ctrl_pred) * (NOISE_LEVEL + TEMPERATURE)
             ctrl_pred = ctrl_pred + noise
             
-        # 严格范围限制并添加到生成列表
+        # 严格范围限制
         ctrl_pred_np = ctrl_pred.squeeze(0).cpu().numpy()  # (PREDICT_STEPS, 32)
         for i in range(PREDICT_STEPS):
             frame = ctrl_pred_np[i].copy()
@@ -166,11 +170,37 @@ def inference_loop():
             frame[29] = np.clip(frame[29], -0.8, 0.6)
             frame[30] = np.clip(frame[30], -0.3, 0.3)
             frame[31] = np.clip(frame[31], -0.55, 0.55)
-            gen_controls.append(frame.astype(np.float32))
+            ctrl_pred_np[i] = frame.astype(np.float32)
         
-        # 更新历史控制序列：移除前PREDICT_STEPS帧，添加新预测的PREDICT_STEPS帧
-        ctrl_pred_tensor = torch.tensor(ctrl_pred_np, dtype=torch.float32).unsqueeze(0).to(device)  # (1, PREDICT_STEPS, 32)
-        ctrl_hist = torch.cat([ctrl_hist[:, PREDICT_STEPS:, :], ctrl_pred_tensor], dim=1)  # (1, HISTORY_K, 32)
+        # 根据不同阶段处理帧
+        if step < 3:
+            # 前三次：直接添加前4帧
+            for i in range(OVERLAP_STEPS):
+                gen_controls.append(ctrl_pred_np[i].copy())
+        else:
+            # 从第四次开始：进行均值计算
+            # 保存当前预测结果用于后续均值计算
+            prediction_history.append(ctrl_pred_np.copy())
+            
+            # 如果有足够的历史预测结果，进行重叠帧均值计算
+            if len(prediction_history) >= 3:
+                # 取最近3次预测的重叠部分进行均值计算
+                # 当前预测的1-4帧
+                current_frames = prediction_history[-1][0:OVERLAP_STEPS]
+                # 上一次预测的5-8帧
+                prev_frames = prediction_history[-2][OVERLAP_STEPS:2*OVERLAP_STEPS]
+                # 上上次预测的9-12帧
+                prev_prev_frames = prediction_history[-3][2*OVERLAP_STEPS:3*OVERLAP_STEPS]
+                
+                # 计算均值并添加到生成列表
+                for i in range(OVERLAP_STEPS):
+                    avg_frame = (current_frames[i] + prev_frames[i] + prev_prev_frames[i]) / 3.0
+                    gen_controls.append(avg_frame.copy())
+        
+        # 更新历史控制序列：移除前OVERLAP_STEPS帧，添加新预测的前OVERLAP_STEPS帧
+        new_frames = ctrl_pred_np[:OVERLAP_STEPS]  # 取前OVERLAP_STEPS帧
+        new_frames_tensor = torch.tensor(new_frames, dtype=torch.float32).unsqueeze(0).to(device)  # (1, OVERLAP_STEPS, 32)
+        ctrl_hist = torch.cat([ctrl_hist[:, OVERLAP_STEPS:, :], new_frames_tensor], dim=1)  # (1, HISTORY_K, 32)
         
         if (step + 1) % 10 == 0 or step == 0:
             print(f"Batch {step+1}/{GENERATE_FRAMES} (Generated {len(gen_controls)} frames)")
