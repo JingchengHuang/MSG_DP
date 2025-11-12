@@ -12,22 +12,22 @@ import re
 # ========== 配置 ==========
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data" / "1030data_sy"
-MODEL_DIR = BASE_DIR / "model" / "20251112_165137_model"
+MODEL_DIR = BASE_DIR / "model" / "20251112_172619_model"
 OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ========== 可配置参数 ==========
 EMOTION = "angry"    # 情绪类型: 'happy','angry','sad','surprise','disgust','fear','neutral'
-LEVEL = 1.0          # 情绪强度: 0.0-1.0
+LEVEL = 0.2         # 情绪强度: 0.0-1.0
 
 HISTORY_K = 10       # 使用10帧历史数据
 PREDICT_STEPS = 5    # 每次预测5帧新数据
-GENERATE_FRAMES = 100  # 生成批次数量（每个批次5帧，总共500帧）
+GENERATE_FRAMES = 200  # 生成批次数量（每个批次5帧，总共500帧）
 FEATURE_DIM = 32
 COND_DIM = 8         # 7-d one-hot + 1-d intensity
 
 NOISE_LEVEL = 0.01   # 噪声扰动水平
-TEMPERATURE = 0.1    # 温度调节参数
+TEMPERATURE = 0.01    # 温度调节参数
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -71,7 +71,7 @@ class DPLSTM(nn.Module):
 # ========== 加载模型权重 ==========
 dp_model = DPLSTM(predict_steps=PREDICT_STEPS).to(device)
 # load dp model - ensure filename matches your saved file
-dp_model.load_state_dict(torch.load(MODEL_DIR / "dp_model_final_20251112_165138.pt", map_location=device))
+dp_model.load_state_dict(torch.load(MODEL_DIR / "dp_model_final_20251112_172621.pt", map_location=device))
 
 dp_model.eval()
 print("DP model loaded successfully.")

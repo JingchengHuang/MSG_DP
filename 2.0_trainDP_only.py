@@ -31,6 +31,10 @@ BATCH_SIZE = 64
 LR = 1e-4
 EPOCHS = 1000
 
+# Loss weights
+RECONSTRUCTION_LOSS_WEIGHT = 1.0    # 重建损失权重
+SMOOTHNESS_LOSS_WEIGHT = 0.1        # 平滑损失权重
+
 NUM_WORKERS = 0      # DataLoader workers (set to 0 for Windows compatibility)
 PIN_MEMORY = False
 
@@ -230,7 +234,16 @@ def train_dp():
 
                 optimizer.zero_grad()
                 y_pred = dp_model(inp)
-                loss = criterion(y_pred.view(-1, SEQ_LEN), y_ctrl.view(-1, SEQ_LEN))
+                
+                # 计算重建损失
+                recon_loss = criterion(y_pred.view(-1, SEQ_LEN), y_ctrl.view(-1, SEQ_LEN))
+                
+                # 计算平滑损失（相邻帧之间的差值尽量小）
+                smooth_loss = torch.mean(torch.abs(y_pred[:, 1:, :] - y_pred[:, :-1, :]))
+                
+                # 总损失 = 重建损失 + 平滑损失
+                loss = RECONSTRUCTION_LOSS_WEIGHT * recon_loss + SMOOTHNESS_LOSS_WEIGHT * smooth_loss
+                
                 loss.backward()
                 optimizer.step()
 
@@ -251,7 +264,16 @@ def train_dp():
                     cond_exp = cond.unsqueeze(1).repeat(1, K, 1)
                     inp = torch.cat([x_ctrl, cond_exp], dim=-1)
                     y_pred = dp_model(inp)
-                    loss = criterion(y_pred.view(-1, SEQ_LEN), y_ctrl.view(-1, SEQ_LEN))
+                    
+                    # 计算重建损失
+                    recon_loss = criterion(y_pred.view(-1, SEQ_LEN), y_ctrl.view(-1, SEQ_LEN))
+                    
+                    # 计算平滑损失（相邻帧之间的差值尽量小）
+                    smooth_loss = torch.mean(torch.abs(y_pred[:, 1:, :] - y_pred[:, :-1, :]))
+                    
+                    # 总损失 = 重建损失 + 平滑损失
+                    loss = RECONSTRUCTION_LOSS_WEIGHT * recon_loss + SMOOTHNESS_LOSS_WEIGHT * smooth_loss
+                    
                     b = x_ctrl.size(0)
                     val_loss += loss.item() * b
                     n_val += b
@@ -294,6 +316,8 @@ def train_dp():
         f.write(f"LR: {LR}\n")
         f.write(f"EPOCHS: {EPOCHS}\n")
         f.write(f"NUM_WORKERS: {NUM_WORKERS}\n")
+        f.write(f"RECONSTRUCTION_LOSS_WEIGHT: {RECONSTRUCTION_LOSS_WEIGHT}\n")
+        f.write(f"SMOOTHNESS_LOSS_WEIGHT: {SMOOTHNESS_LOSS_WEIGHT}\n")
         f.write(f"Best Val Loss: {best_val}\n")
         f.write(f"Total training time (s): {total_time:.2f}\n")
 
