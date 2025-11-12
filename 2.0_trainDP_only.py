@@ -18,9 +18,9 @@ MODEL_DIR = BASE_DIR / "model" / f"{timestamp}_model"
 
 # data/encoding params
 SEQ_LEN = 32         # raw control dim
-K = 10               # number of historical control tokens used as input to DP
+K = 11               # number of historical control tokens used as input to DP (need 11 to compute 10 differences)
 COND_DIM = 8         # 7-d one-hot emotion + 1-d level
-PREDICT_STEPS = 5    # number of future steps to predict
+PREDICT_STEPS = 1    # number of future steps to predict (differences to predict)
 
 # DP model / training hyperparams
 MODEL_DIM = 128
@@ -31,16 +31,12 @@ BATCH_SIZE = 64
 LR = 1e-4
 EPOCHS = 1000
 
-# Loss weights
-RECONSTRUCTION_LOSS_WEIGHT = 1.0    # 重建损失权重
-SMOOTHNESS_LOSS_WEIGHT = 0.1        # 平滑损失权重
-
 NUM_WORKERS = 0      # DataLoader workers (set to 0 for Windows compatibility)
 PIN_MEMORY = False
 
 # ------------------- DP LSTM Model (direct on control parameters) -------------------
 class DPLSTM(nn.Module):
-    def __init__(self, input_dim=SEQ_LEN, cond_dim=COND_DIM, hidden_size=MODEL_DIM, num_layers=NUM_LAYERS, dropout=DROPOUT, predict_steps=5):
+    def __init__(self, input_dim=SEQ_LEN, cond_dim=COND_DIM, hidden_size=MODEL_DIM, num_layers=NUM_LAYERS, dropout=DROPOUT, predict_steps=1):
         super().__init__()
         self.input_dim = input_dim
         self.cond_dim = cond_dim
@@ -65,7 +61,7 @@ class DPLSTM(nn.Module):
         lstm_out, (h_n, c_n) = self.lstm(ctrl_seq_cond)
         # 取最后一个时间步的隐藏状态
         last_hidden = h_n[-1]  # (batch, hidden_size)
-        # 预测多个时间步
+        # 预测一个时间步
         output = self.fc(last_hidden)  # (batch, input_dim * predict_steps)
         # 重塑为(batch, predict_steps, input_dim)
         ctrl_pred = output.view(-1, self.predict_steps, self.input_dim)  # (batch, predict_steps, input_dim)
@@ -111,20 +107,22 @@ def parse_emotion_level_from_name(fname):
 
     return emotion_index, float(level_val)
 
-# ------------------- DP dataset (direct on control parameters) -------------------
+# ------------------- DP dataset (differences prediction) -------------------
 class DPControlDataset(Dataset):
     def __init__(self, all_ctrl_per_file, all_emotion_idx_per_file, all_level_per_file, k=K, predict_steps=PREDICT_STEPS):
         self.k = k
         self.predict_steps = predict_steps
         self.ctrl_dim = SEQ_LEN
         self.cond_dim = COND_DIM
-        self.inputs = []   # will store np arrays
-        self.targets = []
+        self.inputs = []   # will store np arrays (differences)
+        self.targets = []  # will store np arrays (differences)
+        self.last_ctrl = [] # will store last control frame for reconstruction
         self.conds = []
 
         for ctrl_arr, emo_idx, lvl in zip(all_ctrl_per_file, all_emotion_idx_per_file, all_level_per_file):
             n = ctrl_arr.shape[0]
-            max_s = n - (k + predict_steps) + 1  # n - (k+predict_steps) + 1
+            # Need k+1 frames to compute k-1 differences, and predict_steps more frames
+            max_s = n - (k + predict_steps) + 1
             if max_s <= 0:
                 continue
             onehot = np.zeros(7, dtype=np.float32)
@@ -133,14 +131,35 @@ class DPControlDataset(Dataset):
             cond_vec = np.concatenate([onehot, level_arr], axis=0)
 
             for s in range(0, max_s):
-                inp = ctrl_arr[s:s+k].astype(np.float32)      # (k, ctrl_dim)
-                tgt = ctrl_arr[s+k:s+k+predict_steps].astype(np.float32)  # (predict_steps, ctrl_dim)
-                self.inputs.append(inp)
-                self.targets.append(tgt)
+                # Input: k consecutive control frames
+                ctrl_frames = ctrl_arr[s:s+k].astype(np.float32)  # (k, ctrl_dim)
+                
+                # Compute differences between consecutive frames (k-1 differences)
+                ctrl_diffs = np.diff(ctrl_frames, axis=0)  # (k-1, ctrl_dim)
+                
+                # Target: next predict_steps control frames
+                tgt_frames = ctrl_arr[s+k:s+k+predict_steps].astype(np.float32)  # (predict_steps, ctrl_dim)
+                
+                # Compute differences for target frames
+                # We need the last input frame to reconstruct the target frames
+                last_input_frame = ctrl_frames[-1]  # (ctrl_dim,)
+                
+                # Compute differences for target frames
+                # First target difference is from last_input_frame to first target frame
+                tgt_diffs = np.zeros((predict_steps, self.ctrl_dim), dtype=np.float32)
+                prev_frame = last_input_frame
+                for i in range(predict_steps):
+                    tgt_diffs[i] = tgt_frames[i] - prev_frame
+                    prev_frame = tgt_frames[i]
+                
+                self.inputs.append(ctrl_diffs)
+                self.targets.append(tgt_diffs)
+                self.last_ctrl.append(last_input_frame)
                 self.conds.append(cond_vec)
 
         self.inputs = np.stack(self.inputs, axis=0)
         self.targets = np.stack(self.targets, axis=0)
+        self.last_ctrl = np.stack(self.last_ctrl, axis=0)
         self.conds = np.stack(self.conds, axis=0)
         print(f"DP control dataset built. samples: {self.inputs.shape[0]}")
 
@@ -148,7 +167,8 @@ class DPControlDataset(Dataset):
         return self.inputs.shape[0]
 
     def __getitem__(self, idx):
-        return (torch.from_numpy(self.inputs[idx]), torch.from_numpy(self.conds[idx]), torch.from_numpy(self.targets[idx]))
+        return (torch.from_numpy(self.inputs[idx]), torch.from_numpy(self.conds[idx]), 
+                torch.from_numpy(self.targets[idx]), torch.from_numpy(self.last_ctrl[idx]))
 
 # ------------------- Preprocessing: make control sequences -------------------
 def build_control_sequences():
@@ -224,30 +244,22 @@ def train_dp():
             dp_model.train()
             train_loss = 0.0
             n_train = 0
-            for x_ctrl, cond, y_ctrl in train_loader:
-                x_ctrl = x_ctrl.to(device)
+            for x_ctrl_diff, cond, y_ctrl_diff, last_ctrl in train_loader:
+                x_ctrl_diff = x_ctrl_diff.to(device)
                 cond = cond.to(device)
-                y_ctrl = y_ctrl.to(device)
+                y_ctrl_diff = y_ctrl_diff.to(device)
+                last_ctrl = last_ctrl.to(device)
 
-                cond_exp = cond.unsqueeze(1).repeat(1, K, 1)
-                inp = torch.cat([x_ctrl, cond_exp], dim=-1)
+                cond_exp = cond.unsqueeze(1).repeat(1, K-1, 1)
+                inp = torch.cat([x_ctrl_diff, cond_exp], dim=-1)
 
                 optimizer.zero_grad()
-                y_pred = dp_model(inp)
-                
-                # 计算重建损失
-                recon_loss = criterion(y_pred.view(-1, SEQ_LEN), y_ctrl.view(-1, SEQ_LEN))
-                
-                # 计算平滑损失（相邻帧之间的差值尽量小）
-                smooth_loss = torch.mean(torch.abs(y_pred[:, 1:, :] - y_pred[:, :-1, :]))
-                
-                # 总损失 = 重建损失 + 平滑损失
-                loss = RECONSTRUCTION_LOSS_WEIGHT * recon_loss + SMOOTHNESS_LOSS_WEIGHT * smooth_loss
-                
+                y_pred_diff = dp_model(inp)
+                loss = criterion(y_pred_diff.view(-1, SEQ_LEN), y_ctrl_diff.view(-1, SEQ_LEN))
                 loss.backward()
                 optimizer.step()
 
-                b = x_ctrl.size(0)
+                b = x_ctrl_diff.size(0)
                 train_loss += loss.item() * b
                 n_train += b
 
@@ -257,24 +269,16 @@ def train_dp():
             val_loss = 0.0
             n_val = 0
             with torch.no_grad():
-                for x_ctrl, cond, y_ctrl in val_loader:
-                    x_ctrl = x_ctrl.to(device)
+                for x_ctrl_diff, cond, y_ctrl_diff, last_ctrl in val_loader:
+                    x_ctrl_diff = x_ctrl_diff.to(device)
                     cond = cond.to(device)
-                    y_ctrl = y_ctrl.to(device)
-                    cond_exp = cond.unsqueeze(1).repeat(1, K, 1)
-                    inp = torch.cat([x_ctrl, cond_exp], dim=-1)
-                    y_pred = dp_model(inp)
-                    
-                    # 计算重建损失
-                    recon_loss = criterion(y_pred.view(-1, SEQ_LEN), y_ctrl.view(-1, SEQ_LEN))
-                    
-                    # 计算平滑损失（相邻帧之间的差值尽量小）
-                    smooth_loss = torch.mean(torch.abs(y_pred[:, 1:, :] - y_pred[:, :-1, :]))
-                    
-                    # 总损失 = 重建损失 + 平滑损失
-                    loss = RECONSTRUCTION_LOSS_WEIGHT * recon_loss + SMOOTHNESS_LOSS_WEIGHT * smooth_loss
-                    
-                    b = x_ctrl.size(0)
+                    y_ctrl_diff = y_ctrl_diff.to(device)
+                    last_ctrl = last_ctrl.to(device)
+                    cond_exp = cond.unsqueeze(1).repeat(1, K-1, 1)
+                    inp = torch.cat([x_ctrl_diff, cond_exp], dim=-1)
+                    y_pred_diff = dp_model(inp)
+                    loss = criterion(y_pred_diff.view(-1, SEQ_LEN), y_ctrl_diff.view(-1, SEQ_LEN))
+                    b = x_ctrl_diff.size(0)
                     val_loss += loss.item() * b
                     n_val += b
             val_loss /= max(1, n_val)
@@ -316,8 +320,6 @@ def train_dp():
         f.write(f"LR: {LR}\n")
         f.write(f"EPOCHS: {EPOCHS}\n")
         f.write(f"NUM_WORKERS: {NUM_WORKERS}\n")
-        f.write(f"RECONSTRUCTION_LOSS_WEIGHT: {RECONSTRUCTION_LOSS_WEIGHT}\n")
-        f.write(f"SMOOTHNESS_LOSS_WEIGHT: {SMOOTHNESS_LOSS_WEIGHT}\n")
         f.write(f"Best Val Loss: {best_val}\n")
         f.write(f"Total training time (s): {total_time:.2f}\n")
 
