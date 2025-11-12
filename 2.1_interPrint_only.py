@@ -12,18 +12,17 @@ import re
 # ========== 配置 ==========
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data" / "1030data_sy"
-MODEL_DIR = BASE_DIR / "model" / "20251110_213909_model"
+MODEL_DIR = BASE_DIR / "model" / "20251112_165137_model"
 OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ========== 可配置参数 ==========
 EMOTION = "angry"    # 情绪类型: 'happy','angry','sad','surprise','disgust','fear','neutral'
-LEVEL = 0.3          # 情绪强度: 0.0-1.0
+LEVEL = 1.0          # 情绪强度: 0.0-1.0
 
-HISTORY_K = 20       # 使用20帧历史数据
-PREDICT_STEPS = 12   # 每次预测12帧新数据
-OVERLAP_STEPS = 4    # 重叠帧数用于均值计算
-GENERATE_FRAMES = 42  # 生成批次数量（每个批次12帧，总共504帧）
+HISTORY_K = 10       # 使用10帧历史数据
+PREDICT_STEPS = 5    # 每次预测5帧新数据
+GENERATE_FRAMES = 100  # 生成批次数量（每个批次5帧，总共500帧）
 FEATURE_DIM = 32
 COND_DIM = 8         # 7-d one-hot + 1-d intensity
 
@@ -72,7 +71,7 @@ class DPLSTM(nn.Module):
 # ========== 加载模型权重 ==========
 dp_model = DPLSTM(predict_steps=PREDICT_STEPS).to(device)
 # load dp model - ensure filename matches your saved file
-dp_model.load_state_dict(torch.load(MODEL_DIR / "dp_model_final_20251110_213910.pt", map_location=device))
+dp_model.load_state_dict(torch.load(MODEL_DIR / "dp_model_final_20251112_165138.pt", map_location=device))
 
 dp_model.eval()
 print("DP model loaded successfully.")
@@ -173,34 +172,75 @@ def inference_loop():
             ctrl_pred_np[i] = frame.astype(np.float32)
         
         # 根据不同阶段处理帧
-        if step < 3:
-            # 前三次：直接添加前4帧
-            for i in range(OVERLAP_STEPS):
-                gen_controls.append(ctrl_pred_np[i].copy())
+        if step < 5:
+            # 前五次：逐步增加均值帧数
+            prediction_history.append(ctrl_pred_np.copy())
+            
+            if step == 0:
+                # 第1次：直接添加第1帧
+                gen_controls.append(ctrl_pred_np[0].copy())
+            elif step == 1:
+                # 第2次：第1帧与上一次的第2帧均值
+                avg_frame = (ctrl_pred_np[0] + prediction_history[-2][1]) / 2.0
+                gen_controls.append(avg_frame.copy())
+            elif step == 2:
+                # 第3次：第1帧与上一次的第2帧、上上次的第3帧均值
+                avg_frame = (ctrl_pred_np[0] + prediction_history[-2][1] + prediction_history[-3][2]) / 3.0
+                gen_controls.append(avg_frame.copy())
+            elif step == 3:
+                # 第4次：第1帧与上一次的第2帧、上上次的第3帧、上上上次的第4帧均值
+                avg_frame = (ctrl_pred_np[0] + prediction_history[-2][1] + prediction_history[-3][2] + prediction_history[-4][3]) / 4.0
+                gen_controls.append(avg_frame.copy())
+            elif step == 4:
+                # 第5次：第1帧与上一次的第2帧、上上次的第3帧、上上上次的第4帧、上上上上次的第5帧均值
+                avg_frame = (ctrl_pred_np[0] + prediction_history[-2][1] + prediction_history[-3][2] + prediction_history[-4][3] + prediction_history[-5][4]) / 5.0
+                gen_controls.append(avg_frame.copy())
         else:
-            # 从第四次开始：进行均值计算
+            # 从第五次开始：进行完整的均值计算（每1帧做均值）
             # 保存当前预测结果用于后续均值计算
             prediction_history.append(ctrl_pred_np.copy())
             
+            # 保持只保留最近5次预测
+            if len(prediction_history) > 5:
+                prediction_history.pop(0)
+            
             # 如果有足够的历史预测结果，进行重叠帧均值计算
-            if len(prediction_history) >= 3:
-                # 取最近3次预测的重叠部分进行均值计算
-                # 当前预测的1-4帧
-                current_frames = prediction_history[-1][0:OVERLAP_STEPS]
-                # 上一次预测的5-8帧
-                prev_frames = prediction_history[-2][OVERLAP_STEPS:2*OVERLAP_STEPS]
-                # 上上次预测的9-12帧
-                prev_prev_frames = prediction_history[-3][2*OVERLAP_STEPS:3*OVERLAP_STEPS]
+            if len(prediction_history) >= 5:
+                # 对每1帧进行重叠均值计算
+                # 当前预测的第1帧
+                current_frame = prediction_history[-1][0]
+                # 上一次预测的第2帧
+                prev_frame = prediction_history[-2][1]
+                # 上上次预测的第3帧
+                prev_prev_frame = prediction_history[-3][2]
+                # 上上上次预测的第4帧
+                prev_prev_prev_frame = prediction_history[-4][3]
+                # 上上上上次预测的第5帧
+                prev_prev_prev_prev_frame = prediction_history[-5][4]
                 
-                # 计算均值并添加到生成列表
-                for i in range(OVERLAP_STEPS):
-                    avg_frame = (current_frames[i] + prev_frames[i] + prev_prev_frames[i]) / 3.0
-                    gen_controls.append(avg_frame.copy())
+                # 计算均值
+                avg_frame = (current_frame + prev_frame + prev_prev_frame + 
+                           prev_prev_prev_frame + prev_prev_prev_prev_frame) / 5.0
+                gen_controls.append(avg_frame.copy())
         
-        # 更新历史控制序列：移除前OVERLAP_STEPS帧，添加新预测的前OVERLAP_STEPS帧
-        new_frames = ctrl_pred_np[:OVERLAP_STEPS]  # 取前OVERLAP_STEPS帧
-        new_frames_tensor = torch.tensor(new_frames, dtype=torch.float32).unsqueeze(0).to(device)  # (1, OVERLAP_STEPS, 32)
-        ctrl_hist = torch.cat([ctrl_hist[:, OVERLAP_STEPS:, :], new_frames_tensor], dim=1)  # (1, HISTORY_K, 32)
+        # 更新历史控制序列：移除前1帧，添加新预测的第1帧（或均值帧）
+        if step < 5:
+            # 前五次：使用当前推理的第1帧更新滑窗
+            new_frame = ctrl_pred_np[0:1]  # 取第1帧
+        else:
+            # 从第五次开始：使用均值帧更新滑窗
+            if len(prediction_history) >= 5:
+                # 使用刚计算的均值帧
+                avg_frame = (prediction_history[-1][0] + prediction_history[-2][1] + 
+                           prediction_history[-3][2] + prediction_history[-4][3] + 
+                           prediction_history[-5][4]) / 5.0
+                new_frame = avg_frame.reshape(1, -1)
+            else:
+                # 如果还没有足够的历史，使用当前预测的第1帧
+                new_frame = ctrl_pred_np[0:1]
+        
+        new_frame_tensor = torch.tensor(new_frame, dtype=torch.float32).unsqueeze(0).to(device)  # (1, 1, 32)
+        ctrl_hist = torch.cat([ctrl_hist[:, 1:, :], new_frame_tensor], dim=1)  # (1, HISTORY_K, 32)
         
         if (step + 1) % 10 == 0 or step == 0:
             print(f"Batch {step+1}/{GENERATE_FRAMES} (Generated {len(gen_controls)} frames)")

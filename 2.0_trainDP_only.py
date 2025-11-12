@@ -18,9 +18,9 @@ MODEL_DIR = BASE_DIR / "model" / f"{timestamp}_model"
 
 # data/encoding params
 SEQ_LEN = 32         # raw control dim
-K = 20               # number of historical control tokens used as input to DP
+K = 10               # number of historical control tokens used as input to DP
 COND_DIM = 8         # 7-d one-hot emotion + 1-d level
-PREDICT_STEPS = 12   # number of future steps to predict
+PREDICT_STEPS = 5    # number of future steps to predict
 
 # DP model / training hyperparams
 MODEL_DIM = 128
